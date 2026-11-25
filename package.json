@@ -38,7 +38,7 @@
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "bin": {
-    "tiny-web-push": "./dist/bin.js"
+    "tiny-web-push": "dist/bin.js"
   },
   "files": [
     "dist",
