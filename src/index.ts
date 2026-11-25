@@ -1,19 +1,10 @@
-import {
-  createCipheriv,
-  createECDH,
-  createPrivateKey,
-  generateKeyPairSync,
-  hkdfSync,
-  randomBytes,
-  sign,
-  type KeyObject,
-} from 'node:crypto';
-
 /**
- * Standard Web Push on node:crypto, with no dependencies:
+ * Standard Web Push on Web Crypto and fetch, with no dependencies. It runs anywhere both exist:
+ * Node 20+, Deno, Bun, Cloudflare Workers and Vercel Edge.
  * - RFC 8291 message encryption (aes128gcm, RFC 8188), pinned by the RFC's Appendix A test;
  * - RFC 8292 VAPID, an ES256 JWT that tells the push service who is sending.
  */
+
 
 /** The browser's `PushSubscription.toJSON()`. Other fields (like expirationTime) are ignored. */
 export type PushSubscriptionJSON = {
@@ -79,32 +70,108 @@ export type WebPushSendResult = {
   host: string | null;
 };
 
+
 const RECORD_SIZE = 4096;
 const HEADER_SIZE = 86;
 const TAG_SIZE = 16;
 /** The longest payload one record can carry: 4096 - 86 header - 1 delimiter - 16 tag. */
 export const MAX_PAYLOAD_BYTES = RECORD_SIZE - HEADER_SIZE - 1 - TAG_SIZE;
 
-const KEY_INFO = Buffer.from('WebPush: info\0', 'latin1');
-const CEK_INFO = Buffer.from('Content-Encoding: aes128gcm\0', 'latin1');
-const NONCE_INFO = Buffer.from('Content-Encoding: nonce\0', 'latin1');
-/** RFC 8188: the last (and here only) record ends with 0x02 before encryption. */
-const LAST_RECORD_DELIMITER = Buffer.from([0x02]);
+type Bytes = Uint8Array<ArrayBuffer>;
 
-function hkdf(ikm: Buffer, salt: Buffer, info: Buffer, length: number): Buffer {
-  return Buffer.from(hkdfSync('sha256', ikm, salt, info, length));
+const utf8 = (text: string): Bytes => new TextEncoder().encode(text) as Bytes;
+
+const KEY_INFO = utf8('WebPush: info\0');
+const CEK_INFO = utf8('Content-Encoding: aes128gcm\0');
+const NONCE_INFO = utf8('Content-Encoding: nonce\0');
+/** RFC 8188: the last (and here only) record ends with 0x02 before encryption. */
+const LAST_RECORD_DELIMITER = new Uint8Array([0x02]);
+
+const subtle = () => globalThis.crypto.subtle;
+const P256_ECDH = { name: 'ECDH', namedCurve: 'P-256' } as const;
+const P256_ECDSA = { name: 'ECDSA', namedCurve: 'P-256' } as const;
+const ES256 = { name: 'ECDSA', hash: 'SHA-256' } as const;
+
+function concat(...parts: Uint8Array[]): Bytes {
+  const out = new Uint8Array(parts.reduce((total, part) => total + part.length, 0));
+  let offset = 0;
+  for (const part of parts) {
+    out.set(part, offset);
+    offset += part.length;
+  }
+  return out;
+}
+
+const BASE64URL_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
+const BASE64URL_VALUES = new Map([...BASE64URL_ALPHABET].map((char, index) => [char, index]));
+
+/** Unpadded base64url. */
+function encodeBase64Url(bytes: Uint8Array): string {
+  let out = '';
+  for (let i = 0; i < bytes.length; i += 3) {
+    const chunk = (bytes[i]! << 16) | ((bytes[i + 1] ?? 0) << 8) | (bytes[i + 2] ?? 0);
+    const chars = Math.min(4, Math.ceil(((bytes.length - i) * 8) / 6));
+    for (let j = 0; j < chars; j++) out += BASE64URL_ALPHABET[(chunk >> (18 - 6 * j)) & 63];
+  }
+  return out;
 }
 
 const BASE64URL = /^[A-Za-z0-9_-]+$/;
 
 /** Strict base64url of an exact length. Trailing `=` padding is accepted and ignored. */
-function decodeBase64Url(value: unknown, bytes: number): Buffer | null {
+function decodeBase64Url(value: unknown, bytes: number): Bytes | null {
   if (typeof value !== 'string') return null;
   const unpadded = value.replace(/={1,2}$/, '');
-  if (!BASE64URL.test(unpadded)) return null;
-  const decoded = Buffer.from(unpadded, 'base64url');
-  if (decoded.length !== bytes || decoded.toString('base64url') !== unpadded) return null;
-  return decoded;
+  if (!BASE64URL.test(unpadded) || Math.floor((unpadded.length * 6) / 8) !== bytes) return null;
+  const decoded = new Uint8Array(bytes);
+  let buffer = 0;
+  let bits = 0;
+  let index = 0;
+  for (const char of unpadded) {
+    buffer = ((buffer << 6) | BASE64URL_VALUES.get(char)!) & 0xffffff;
+    bits += 6;
+    if (bits >= 8) {
+      bits -= 8;
+      decoded[index++] = (buffer >> bits) & 0xff;
+    }
+  }
+  // Leftover bits must be zero, so each key has exactly one spelling.
+  return encodeBase64Url(decoded) === unpadded ? decoded : null;
+}
+
+async function hkdf(ikm: Bytes, salt: Bytes, info: Bytes, length: number): Promise<Bytes> {
+  const key = await subtle().importKey('raw', ikm, 'HKDF', false, ['deriveBits']);
+  const params = { name: 'HKDF', hash: 'SHA-256', salt, info };
+  return new Uint8Array(await subtle().deriveBits(params, key, length * 8));
+}
+
+/**
+ * PKCS#8 for a P-256 private key with no public key in it. Web Crypto can't import a bare
+ * scalar, so this is how a fixed test key gets in; the runtime works out the public key.
+ */
+const P256_PKCS8_PREFIX = new Uint8Array([
+  0x30, 0x41, 0x02, 0x01, 0x00, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01,
+  0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, 0x04, 0x27, 0x30, 0x25, 0x02, 0x01,
+  0x01, 0x04, 0x20,
+]);
+
+/** A one-time ECDH key pair for the sender, and its public key as a 65-byte point. */
+async function senderKeyPair(
+  fixed?: Uint8Array
+): Promise<{ privateKey: CryptoKey; publicKey: Bytes }> {
+  if (!fixed) {
+    const pair = await subtle().generateKey(P256_ECDH, true, ['deriveBits']);
+    const publicKey = new Uint8Array(await subtle().exportKey('raw', pair.publicKey));
+    return { privateKey: pair.privateKey, publicKey };
+  }
+  if (fixed.length !== 32) throw new Error('Invalid sender key');
+  const pkcs8 = concat(P256_PKCS8_PREFIX, fixed);
+  const privateKey = await subtle().importKey('pkcs8', pkcs8, P256_ECDH, true, ['deriveBits']);
+  const jwk = await subtle().exportKey('jwk', privateKey);
+  const x = decodeBase64Url(jwk.x, 32);
+  const y = decodeBase64Url(jwk.y, 32);
+  if (!x || !y) throw new Error('Invalid sender key');
+  return { privateKey, publicKey: concat(new Uint8Array([0x04]), x, y) };
 }
 
 /** Fixed inputs for known-answer tests. Real sends always use fresh randomness. */
@@ -125,54 +192,60 @@ export type WebPushFixedInputs = {
  * @param fixed - Fixed salt and sender key, for known-answer tests only.
  * @returns The whole request body: an 86-byte header (salt, record size, the sender's one-time
  *   public key) followed by the ciphertext.
- * @throws If a key is the wrong size or not on the curve, or the message is too long.
+ * @throws If a key is the wrong size or not on the curve, or the message is too long. As a
+ *   rejected promise, like every other error here.
  */
-export function encryptWebPushPayload(
+export async function encryptWebPushPayload(
   plaintext: Uint8Array,
   browserPublicKey: Uint8Array,
   authSecret: Uint8Array,
   fixed?: WebPushFixedInputs
-): Buffer {
-  const uaPublic = Buffer.from(browserPublicKey);
+): Promise<Uint8Array> {
+  const uaPublic = concat(browserPublicKey);
   if (uaPublic.length !== 65 || uaPublic[0] !== 0x04) throw new Error('Invalid browser key');
   if (authSecret.length !== 16) throw new Error('Invalid auth secret');
   if (plaintext.length > MAX_PAYLOAD_BYTES) throw new Error('Push message too long');
+  if (fixed && fixed.salt.length !== 16) throw new Error('Invalid salt');
 
-  const ecdh = createECDH('prime256v1');
-  if (fixed) ecdh.setPrivateKey(Buffer.from(fixed.senderPrivateKey));
-  else ecdh.generateKeys();
-  const asPublic = ecdh.getPublicKey();
-  const salt = fixed ? Buffer.from(fixed.salt) : randomBytes(16);
+  let uaKey: CryptoKey;
+  try {
+    // Import refuses a point that is not on the curve.
+    uaKey = await subtle().importKey('raw', uaPublic, P256_ECDH, false, []);
+  } catch {
+    throw new Error('Invalid browser key');
+  }
+  const sender = await senderKeyPair(fixed?.senderPrivateKey);
+  const salt = fixed ? concat(fixed.salt) : globalThis.crypto.getRandomValues(new Uint8Array(16));
 
-  // computeSecret throws if the browser key is not on the curve.
-  const ecdhSecret = ecdh.computeSecret(uaPublic);
-  const ikm = hkdf(
-    ecdhSecret,
-    Buffer.from(authSecret),
-    Buffer.concat([KEY_INFO, uaPublic, asPublic]),
-    32
+  const ecdhSecret = new Uint8Array(
+    await subtle().deriveBits({ name: 'ECDH', public: uaKey }, sender.privateKey, 256)
   );
-  const cek = hkdf(ikm, salt, CEK_INFO, 16);
-  const nonce = hkdf(ikm, salt, NONCE_INFO, 12);
+  const keyInfo = concat(KEY_INFO, uaPublic, sender.publicKey);
+  const ikm = await hkdf(ecdhSecret, concat(authSecret), keyInfo, 32);
+  const cek = await hkdf(ikm, salt, CEK_INFO, 16);
+  const nonce = await hkdf(ikm, salt, NONCE_INFO, 12);
 
-  const cipher = createCipheriv('aes-128-gcm', cek, nonce);
-  const ciphertext = Buffer.concat([
-    cipher.update(Buffer.concat([plaintext, LAST_RECORD_DELIMITER])),
-    cipher.final(),
-    cipher.getAuthTag(),
-  ]);
+  const aesKey = await subtle().importKey('raw', cek, 'AES-GCM', false, ['encrypt']);
+  // Web Crypto appends the 16-byte tag to the ciphertext, as aes128gcm wants.
+  const ciphertext = new Uint8Array(
+    await subtle().encrypt(
+      { name: 'AES-GCM', iv: nonce, tagLength: TAG_SIZE * 8 },
+      aesKey,
+      concat(plaintext, LAST_RECORD_DELIMITER)
+    )
+  );
 
-  const header = Buffer.alloc(16 + 4 + 1);
-  salt.copy(header, 0);
-  header.writeUInt32BE(RECORD_SIZE, 16);
-  header.writeUInt8(asPublic.length, 20);
-  return Buffer.concat([header, asPublic, ciphertext]);
+  const header = new Uint8Array(16 + 4 + 1);
+  header.set(salt, 0);
+  new DataView(header.buffer).setUint32(16, RECORD_SIZE);
+  header[20] = sender.publicKey.length;
+  return concat(header, sender.publicKey, ciphertext);
 }
 
-const signingKeys = new Map<string, KeyObject>();
+const signingKeys = new Map<string, CryptoKey>();
 
-/** The private key as a KeyObject. Throws unless both keys are valid and belong together. */
-function vapidSigningKey(vapid: VapidOptions): KeyObject {
+/** The private key, ready to sign. Rejects unless both keys are valid and belong together. */
+async function vapidSigningKey(vapid: VapidOptions): Promise<CryptoKey> {
   const cacheKey = `${vapid.publicKey}|${vapid.privateKey}`;
   const cached = signingKeys.get(cacheKey);
   if (cached) return cached;
@@ -180,21 +253,37 @@ function vapidSigningKey(vapid: VapidOptions): KeyObject {
   const publicKey = decodeBase64Url(vapid.publicKey, 65);
   const d = decodeBase64Url(vapid.privateKey, 32);
   if (!publicKey || publicKey[0] !== 0x04 || !d) throw new TypeError('Invalid VAPID keys');
-  const ecdh = createECDH('prime256v1');
-  ecdh.setPrivateKey(d);
-  if (!ecdh.getPublicKey().equals(publicKey)) {
-    throw new TypeError('VAPID public and private keys do not match');
+  let verifyKey: CryptoKey;
+  try {
+    verifyKey = await subtle().importKey('raw', publicKey, P256_ECDSA, false, ['verify']);
+  } catch {
+    throw new TypeError('Invalid VAPID keys');
   }
-  const key = createPrivateKey({
-    key: {
-      kty: 'EC',
-      crv: 'P-256',
-      d: d.toString('base64url'),
-      x: publicKey.subarray(1, 33).toString('base64url'),
-      y: publicKey.subarray(33, 65).toString('base64url'),
-    },
-    format: 'jwk',
-  });
+
+  // Not every runtime checks that d matches x and y on import, so sign something and verify it.
+  let key: CryptoKey | undefined;
+  let matches = false;
+  try {
+    key = await subtle().importKey(
+      'jwk',
+      {
+        kty: 'EC',
+        crv: 'P-256',
+        d: encodeBase64Url(d),
+        x: encodeBase64Url(publicKey.subarray(1, 33)),
+        y: encodeBase64Url(publicKey.subarray(33, 65)),
+      },
+      P256_ECDSA,
+      false,
+      ['sign']
+    );
+    const probe = utf8('tiny-web-push key check');
+    const signature = await subtle().sign(ES256, key, probe);
+    matches = await subtle().verify(ES256, verifyKey, signature, probe);
+  } catch {
+    // A runtime that does check refuses the import; that is a mismatch too.
+  }
+  if (!matches || !key) throw new TypeError('VAPID public and private keys do not match');
   if (signingKeys.size > 32) signingKeys.clear();
   signingKeys.set(cacheKey, key);
   return key;
@@ -213,17 +302,18 @@ const vapidTokens = new Map<string, { header: string; issuedAt: number }>();
  * @param vapid - Your VAPID keys and contact URL.
  * @param nowSec - The current time in Unix seconds. Defaults to now.
  * @returns The header value: `vapid t=<jwt>, k=<public key>`.
- * @throws TypeError if the keys are invalid or don't match, or the subject isn't mailto: or https:.
+ * @throws TypeError (as a rejected promise) if the keys are invalid or don't match, or the
+ *   subject isn't mailto: or https:.
  */
-export function vapidAuthorization(
+export async function vapidAuthorization(
   endpoint: string,
   vapid: VapidOptions,
   nowSec: number = Math.floor(Date.now() / 1000)
-): string {
+): Promise<string> {
   if (!/^(mailto:|https:)/.test(vapid.subject)) {
     throw new TypeError('VAPID subject must be a mailto: or https: URL');
   }
-  const key = vapidSigningKey(vapid);
+  const key = await vapidSigningKey(vapid);
   const audience = new URL(endpoint).origin;
   const cacheKey = `${vapid.publicKey}|${vapid.subject}|${audience}`;
   const cached = vapidTokens.get(cacheKey);
@@ -231,16 +321,15 @@ export function vapidAuthorization(
     return cached.header;
   }
 
-  const encode = (value: unknown) => Buffer.from(JSON.stringify(value)).toString('base64url');
+  const encode = (value: unknown) => encodeBase64Url(utf8(JSON.stringify(value)));
   const unsigned = `${encode({ typ: 'JWT', alg: 'ES256' })}.${encode({
     aud: audience,
     exp: nowSec + VAPID_TOKEN_LIFETIME_SECONDS,
     sub: vapid.subject,
   })}`;
-  const signature = sign('sha256', Buffer.from(unsigned), {
-    key,
-    dsaEncoding: 'ieee-p1363',
-  }).toString('base64url');
+  // Web Crypto signs ECDSA as raw r || s (64 bytes), which is exactly what a JWT wants.
+  const raw = new Uint8Array(await subtle().sign(ES256, key, utf8(unsigned)));
+  const signature = encodeBase64Url(raw);
   const header = `vapid t=${unsigned}.${signature}, k=${vapid.publicKey}`;
   if (vapidTokens.size > 32) vapidTokens.clear();
   vapidTokens.set(cacheKey, { header, issuedAt: nowSec });
@@ -253,19 +342,13 @@ export function vapidAuthorization(
  *
  * @returns `publicKey` (65-byte P-256 point) and `privateKey` (32 bytes), both base64url.
  */
-export function generateVapidKeys(): { publicKey: string; privateKey: string } {
-  const { privateKey } = generateKeyPairSync('ec', { namedCurve: 'P-256' });
-  // JWK coordinates and the scalar are always padded to 32 bytes.
-  const jwk = privateKey.export({ format: 'jwk' });
-  if (!jwk.d || !jwk.x || !jwk.y) throw new Error('Key generation failed');
-  return {
-    publicKey: Buffer.concat([
-      Buffer.from([0x04]),
-      Buffer.from(jwk.x, 'base64url'),
-      Buffer.from(jwk.y, 'base64url'),
-    ]).toString('base64url'),
-    privateKey: jwk.d,
-  };
+export async function generateVapidKeys(): Promise<{ publicKey: string; privateKey: string }> {
+  const pair = await subtle().generateKey(P256_ECDSA, true, ['sign', 'verify']);
+  const publicKey = new Uint8Array(await subtle().exportKey('raw', pair.publicKey));
+  // JWK pads the scalar to 32 bytes. Decoding checks that, and drops any padding.
+  const d = decodeBase64Url((await subtle().exportKey('jwk', pair.privateKey)).d, 32);
+  if (!d || publicKey.length !== 65) throw new Error('Key generation failed');
+  return { publicKey: encodeBase64Url(publicKey), privateKey: encodeBase64Url(d) };
 }
 
 const PUSH_SERVICE_HOSTS = new Set([
@@ -363,16 +446,16 @@ export async function sendWebPush(
   const host = endpoint.hostname;
 
   // Bad VAPID options throw here, before anything is sent.
-  const authorization = vapidAuthorization(endpoint.href, options.vapid);
+  const authorization = await vapidAuthorization(endpoint.href, options.vapid);
 
   const browserKey = decodeBase64Url(subscription.keys?.p256dh, 65);
   const authSecret = decodeBase64Url(subscription.keys?.auth, 16);
   if (!browserKey || !authSecret) return { result: 'invalid', status: null, host };
 
-  let body: Buffer;
+  let body: Uint8Array;
   try {
-    const plaintext = typeof payload === 'string' ? Buffer.from(payload, 'utf8') : payload;
-    body = encryptWebPushPayload(plaintext, browserKey, authSecret);
+    const plaintext = typeof payload === 'string' ? new TextEncoder().encode(payload) : payload;
+    body = await encryptWebPushPayload(plaintext, browserKey, authSecret);
   } catch {
     return { result: 'invalid', status: null, host };
   }
@@ -392,7 +475,7 @@ export async function sendWebPush(
     response = await fetchImpl(subscription.endpoint, {
       method: 'POST',
       headers,
-      body: new Uint8Array(body),
+      body: body as Uint8Array<ArrayBuffer>,
       redirect: 'error',
       signal: AbortSignal.timeout(options.timeoutMs ?? 10_000),
     });

@@ -1,5 +1,4 @@
 import { readFileSync } from 'node:fs';
-import { styleText } from 'node:util';
 
 import { generateVapidKeys } from './index.js';
 
@@ -22,7 +21,14 @@ export function shouldUseColor(isTTY: boolean | undefined, env: NodeJS.ProcessEn
   return Boolean(isTTY) && !env.NO_COLOR;
 }
 
-type Style = Parameters<typeof styleText>[0];
+/** The few ANSI styles the CLI uses, as [on, off] codes. */
+const STYLES = { bold: [1, 22], dim: [2, 22], red: [31, 39] } as const;
+type Style = keyof typeof STYLES;
+
+function style(name: Style, text: string): string {
+  const [on, off] = STYLES[name];
+  return `\u001b[${on}m${text}\u001b[${off}m`;
+}
 
 /** The package version, read from package.json next to dist/ (or src/ in tests). */
 function version(): string {
@@ -58,8 +64,8 @@ function help(paint: (style: Style, text: string) => string): string {
  * @param io - Where to write, and whether to use colour.
  * @returns The process exit code.
  */
-export function runCli(args: readonly string[], io: CliIo): number {
-  const paint = (style: Style, text: string) => (io.color ? styleText(style, text) : text);
+export async function runCli(args: readonly string[], io: CliIo): Promise<number> {
+  const paint = (name: Style, text: string) => (io.color ? style(name, text) : text);
   const [command, ...rest] = args;
 
   if (command === undefined || command === '-h' || command === '--help' || command === 'help') {
@@ -71,7 +77,7 @@ export function runCli(args: readonly string[], io: CliIo): number {
     return 0;
   }
   if (command === 'keys' && rest.length === 0) {
-    const { publicKey, privateKey } = generateVapidKeys();
+    const { publicKey, privateKey } = await generateVapidKeys();
     // Plain KEY=value lines, so the output can go straight into a .env file.
     io.out(`VAPID_PUBLIC_KEY=${publicKey}\nVAPID_PRIVATE_KEY=${privateKey}\n`);
     if (io.color) {

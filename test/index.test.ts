@@ -40,8 +40,8 @@ const RFC = {
    pK4Mqgkf1CXztLVBSt2Ks3oZwbuwXPXLWyouBWLVWGNWQexSgSxsj_Qulcy4a-fN`,
 };
 
-function makeVapid(): VapidOptions {
-  return { ...generateVapidKeys(), subject: 'mailto:push@example.com' };
+async function makeVapid(): Promise<VapidOptions> {
+  return { ...(await generateVapidKeys()), subject: 'mailto:push@example.com' };
 }
 
 function makeBrowser() {
@@ -62,7 +62,8 @@ function makeBrowser() {
 }
 
 /** What a browser does with a push body: RFC 8291 decryption with its private key. */
-function decrypt(body: Buffer, uaEcdh: ReturnType<typeof createECDH>, authSecret: Buffer) {
+function decrypt(bytes: Uint8Array, uaEcdh: ReturnType<typeof createECDH>, authSecret: Buffer) {
+  const body = Buffer.from(bytes);
   const salt = body.subarray(0, 16);
   const recordSize = body.readUInt32BE(16);
   const keyLength = body.readUInt8(20);
@@ -90,11 +91,13 @@ function okResponse(status = 201) {
 }
 
 describe('RFC 8291 message encryption', () => {
-  it('reproduces the Appendix A example byte for byte', () => {
-    const body = encryptWebPushPayload(b64(RFC.plaintext), b64(RFC.uaPublic), b64(RFC.authSecret), {
-      salt: b64(RFC.salt),
-      senderPrivateKey: b64(RFC.asPrivate),
-    });
+  it('reproduces the Appendix A example byte for byte', async () => {
+    const body = Buffer.from(
+      await encryptWebPushPayload(b64(RFC.plaintext), b64(RFC.uaPublic), b64(RFC.authSecret), {
+        salt: b64(RFC.salt),
+        senderPrivateKey: b64(RFC.asPrivate),
+      })
+    );
 
     expect(body.subarray(0, 86).toString('base64url')).toBe(b64(RFC.header).toString('base64url'));
     expect(body.subarray(86).toString('base64url')).toBe(b64(RFC.ciphertext).toString('base64url'));
@@ -110,10 +113,10 @@ describe('RFC 8291 message encryption', () => {
     expect(plaintext.toString('utf8')).toBe('When I grow up, I want to be a watermelon');
   });
 
-  it('round-trips a fresh message and writes the aes128gcm header', () => {
+  it('round-trips a fresh message and writes the aes128gcm header', async () => {
     const browser = makeBrowser();
     const message = '{"title":"Hello"}';
-    const body = encryptWebPushPayload(
+    const body = await encryptWebPushPayload(
       Buffer.from(message),
       browser.ecdh.getPublicKey(),
       browser.auth
@@ -123,32 +126,42 @@ describe('RFC 8291 message encryption', () => {
     expect(result.keyLength).toBe(65);
     expect(result.plaintext.toString()).toBe(message);
     // A fresh salt and sender key every time.
-    const again = encryptWebPushPayload(
+    const again = await encryptWebPushPayload(
       Buffer.from(message),
       browser.ecdh.getPublicKey(),
       browser.auth
     );
-    expect(again.subarray(0, 16).equals(body.subarray(0, 16))).toBe(false);
+    expect(Buffer.from(again.subarray(0, 16)).equals(body.subarray(0, 16))).toBe(false);
+    // The sender key is fresh too.
+    expect(Buffer.from(again.subarray(21, 86)).equals(body.subarray(21, 86))).toBe(false);
   });
 
-  it('refuses bad keys and oversized messages, and fits exactly MAX_PAYLOAD_BYTES', () => {
+  it('refuses bad keys and oversized messages, and fits exactly MAX_PAYLOAD_BYTES', async () => {
     const browser = makeBrowser();
     const key = browser.ecdh.getPublicKey();
-    expect(() => encryptWebPushPayload(Buffer.from('x'), Buffer.alloc(65), browser.auth)).toThrow();
-    expect(() => encryptWebPushPayload(Buffer.from('x'), key, Buffer.alloc(8))).toThrow();
-    expect(() =>
+    await expect(
+      encryptWebPushPayload(Buffer.from('x'), Buffer.alloc(65), browser.auth)
+    ).rejects.toThrow();
+    // Right shape, but not a point on the curve.
+    const offCurve = Buffer.concat([Buffer.from([0x04]), Buffer.alloc(64, 1)]);
+    await expect(encryptWebPushPayload(Buffer.from('x'), offCurve, browser.auth)).rejects.toThrow(
+      'Invalid browser key'
+    );
+    await expect(encryptWebPushPayload(Buffer.from('x'), key, Buffer.alloc(8))).rejects.toThrow();
+    await expect(
       encryptWebPushPayload(Buffer.alloc(MAX_PAYLOAD_BYTES + 1), key, browser.auth)
-    ).toThrow();
-    const full = encryptWebPushPayload(Buffer.alloc(MAX_PAYLOAD_BYTES), key, browser.auth);
+    ).rejects.toThrow();
+    const full = await encryptWebPushPayload(Buffer.alloc(MAX_PAYLOAD_BYTES), key, browser.auth);
     expect(full.length).toBe(4096);
   });
 });
 
 describe('RFC 8292 VAPID', () => {
-  it('signs an ES256 JWT for the push service origin that verifies with the public key', () => {
-    const vapid = makeVapid();
+  it('signs an ES256 JWT for the push service origin that verifies with the public key', async () => {
+    const vapid = await makeVapid();
     const nowSec = 1_800_000_000;
-    const header = vapidAuthorization('https://fcm.googleapis.com/fcm/send/abc', vapid, nowSec);
+    const endpoint = 'https://fcm.googleapis.com/fcm/send/abc';
+    const header = await vapidAuthorization(endpoint, vapid, nowSec);
     const match = /^vapid t=([^,]+), k=([A-Za-z0-9_-]+)$/.exec(header);
     expect(match).not.toBeNull();
     const [, token, k] = match!;
@@ -186,31 +199,31 @@ describe('RFC 8292 VAPID', () => {
     ).toBe(true);
   });
 
-  it('reuses a token for an hour per origin', () => {
-    const vapid = makeVapid();
-    const first = vapidAuthorization('https://fcm.googleapis.com/a', vapid, 1000);
-    expect(vapidAuthorization('https://fcm.googleapis.com/b', vapid, 1000 + 3599)).toBe(first);
-    expect(vapidAuthorization('https://fcm.googleapis.com/b', vapid, 1000 + 3600)).not.toBe(first);
-    expect(vapidAuthorization('https://web.push.apple.com/b', vapid, 1000)).not.toBe(first);
+  it('reuses a token for an hour per origin', async () => {
+    const vapid = await makeVapid();
+    const at = (endpoint: string, nowSec: number) => vapidAuthorization(endpoint, vapid, nowSec);
+    const first = await at('https://fcm.googleapis.com/a', 1000);
+    expect(await at('https://fcm.googleapis.com/b', 1000 + 3599)).toBe(first);
+    expect(await at('https://fcm.googleapis.com/b', 1000 + 3600)).not.toBe(first);
+    expect(await at('https://web.push.apple.com/b', 1000)).not.toBe(first);
   });
 
-  it('throws on mismatched keys or a bad subject', () => {
-    const vapid = makeVapid();
-    const other = generateVapidKeys();
+  it('throws on mismatched keys or a bad subject', async () => {
+    const vapid = await makeVapid();
+    const other = await generateVapidKeys();
     const url = 'https://fcm.googleapis.com/a';
-    expect(() => vapidAuthorization(url, { ...vapid, privateKey: other.privateKey })).toThrow(
-      /do not match/
-    );
-    expect(() => vapidAuthorization(url, { ...vapid, publicKey: 'nope' })).toThrow();
-    expect(() => vapidAuthorization(url, { ...vapid, subject: 'push@example.com' })).toThrow(
-      /subject/
-    );
+    const auth = (changes: Partial<VapidOptions>) =>
+      vapidAuthorization(url, { ...vapid, ...changes });
+    await expect(auth({ privateKey: other.privateKey })).rejects.toThrow(/do not match/);
+    await expect(auth({ publicKey: other.publicKey })).rejects.toThrow(/do not match/);
+    await expect(auth({ publicKey: 'nope' })).rejects.toThrow(TypeError);
+    await expect(auth({ subject: 'push@example.com' })).rejects.toThrow(/subject/);
   });
 });
 
 describe('sendWebPush', () => {
   it('POSTs the encrypted body with the Web Push headers and no redirects', async () => {
-    const vapid = makeVapid();
+    const vapid = await makeVapid();
     const browser = makeBrowser();
     const { response, cancel } = okResponse(201);
     const fetchImpl = vi.fn<FetchLike>().mockResolvedValue(response);
@@ -249,7 +262,7 @@ describe('sendWebPush', () => {
       keys: { p256dh: `${browser.subscription.keys.p256dh}=`, auth: `${browser.subscription.keys.auth}==` },
     };
     const result = await sendWebPush(padded, new Uint8Array([1, 2]), {
-      vapid: makeVapid(),
+      vapid: await makeVapid(),
       fetch: fetchImpl,
     });
     expect(result.result).toBe('sent');
@@ -260,7 +273,7 @@ describe('sendWebPush', () => {
   });
 
   it('classifies every push service answer', async () => {
-    const vapid = makeVapid();
+    const vapid = await makeVapid();
     const browser = makeBrowser();
     const cases: Array<[number, string]> = [
       [201, 'sent'],
@@ -287,7 +300,7 @@ describe('sendWebPush', () => {
   });
 
   it('turns a throw or a timeout into failed', async () => {
-    const vapid = makeVapid();
+    const vapid = await makeVapid();
     const browser = makeBrowser();
     const thrown = await sendWebPush(browser.subscription, '{}', {
       vapid,
@@ -307,7 +320,7 @@ describe('sendWebPush', () => {
   });
 
   it('never fetches an endpoint off the allowlist, unless the caller widens it', async () => {
-    const vapid = makeVapid();
+    const vapid = await makeVapid();
     const browser = makeBrowser();
     const fetchImpl = vi.fn<FetchLike>().mockResolvedValue(okResponse(201).response);
     for (const endpoint of [
@@ -356,7 +369,7 @@ describe('sendWebPush', () => {
   });
 
   it('treats unreadable browser keys and oversized payloads as invalid without fetching', async () => {
-    const vapid = makeVapid();
+    const vapid = await makeVapid();
     const browser = makeBrowser();
     const fetchImpl = vi.fn<FetchLike>();
     const badKey = await sendWebPush(
@@ -378,7 +391,7 @@ describe('sendWebPush', () => {
     const fetchImpl = vi.fn<FetchLike>();
     await expect(
       sendWebPush(browser.subscription, '{}', {
-        vapid: { ...makeVapid(), subject: 'nobody' },
+        vapid: { ...(await makeVapid()), subject: 'nobody' },
         fetch: fetchImpl,
       })
     ).rejects.toThrow(TypeError);
@@ -396,70 +409,78 @@ describe('package promises', () => {
     expect(MAX_PAYLOAD_BYTES).toBe(3993);
   });
 
-  it('generates key pairs that sign and verify, and are fresh every time', () => {
-    const a = generateVapidKeys();
-    const b = generateVapidKeys();
+  it('generates key pairs that sign and verify, and are fresh every time', async () => {
+    const a = await generateVapidKeys();
+    const b = await generateVapidKeys();
     expect(Buffer.from(a.publicKey, 'base64url')).toHaveLength(65);
     expect(Buffer.from(a.privateKey, 'base64url')).toHaveLength(32);
     expect(a.privateKey).not.toBe(b.privateKey);
-    expect(() =>
+    await expect(
       vapidAuthorization('https://fcm.googleapis.com/a', { ...a, subject: 'https://example.com' })
-    ).not.toThrow();
+    ).resolves.toMatch(/^vapid t=/);
+  });
+
+  it('builds a library that runs without Node: no node: imports and no Buffer', () => {
+    // pnpm test builds first, so this reads the fresh dist/index.js.
+    const built = readFileSync(new URL('../dist/index.js', import.meta.url), 'utf8');
+    expect(built).not.toContain('node:');
+    expect(built).not.toMatch(/\bBuffer\b/);
   });
 });
 
 describe('CLI', () => {
-  function run(args: string[], color = false) {
+  async function run(args: string[], color = false) {
     let out = '';
     let err = '';
-    const code = runCli(args, { out: (t) => (out += t), err: (t) => (err += t), color });
+    const code = await runCli(args, { out: (t) => (out += t), err: (t) => (err += t), color });
     return { code, out, err };
   }
 
-  it('prints a matching key pair as .env lines, with nothing else on stdout', () => {
-    const { code, out, err } = run(['keys']);
+  it('prints a matching key pair as .env lines, with nothing else on stdout', async () => {
+    const { code, out, err } = await run(['keys']);
     expect(code).toBe(0);
     expect(err).toBe('');
     const match = /^VAPID_PUBLIC_KEY=([\w-]+)\nVAPID_PRIVATE_KEY=([\w-]+)\n$/.exec(out);
     expect(match).not.toBeNull();
     const [, publicKey, privateKey] = match!;
-    expect(() =>
+    await expect(
       vapidAuthorization('https://fcm.googleapis.com/a', {
         publicKey: publicKey!,
         privateKey: privateKey!,
         subject: 'mailto:push@example.com',
       })
-    ).not.toThrow();
+    ).resolves.toMatch(/^vapid t=/);
   });
 
-  it('shows help and the version', () => {
+  it('shows help and the version', async () => {
     for (const args of [[], ['--help'], ['-h']]) {
-      const { code, out } = run(args);
+      const { code, out } = await run(args);
       expect(code).toBe(0);
       expect(out).toContain('tiny-web-push keys');
       expect(out).toContain('Examples');
     }
-    expect(run(['--version']).out).toBe(`${pkg.version}\n`);
-    expect(run(['-v']).code).toBe(0);
+    expect((await run(['--version'])).out).toBe(`${pkg.version}\n`);
+    expect((await run(['-v'])).code).toBe(0);
   });
 
-  it('uses colour only in a terminal without NO_COLOR, and never in the key lines', () => {
+  it('uses colour only in a terminal without NO_COLOR, and never in the key lines', async () => {
     expect(shouldUseColor(true, {})).toBe(true);
     expect(shouldUseColor(false, {})).toBe(false);
     expect(shouldUseColor(undefined, {})).toBe(false);
     expect(shouldUseColor(true, { NO_COLOR: '1' })).toBe(false);
-    expect(run(['--help']).out).not.toContain('\u001b[');
-    const colored = run(['keys'], true);
+    expect((await run(['--help'])).out).not.toContain('\u001b[');
+    expect((await run(['--help'], true)).out).toContain('\u001b[1mUsage\u001b[22m');
+    const colored = await run(['keys'], true);
     expect(colored.out).not.toContain('\u001b[');
     expect(colored.err).toContain('Keep the private key secret');
   });
 
-  it('explains a usage error and exits 2', () => {
-    const unknown = run(['nope']);
+  it('explains a usage error and exits 2', async () => {
+    const unknown = await run(['nope']);
     expect(unknown.code).toBe(2);
     expect(unknown.out).toBe('');
     expect(unknown.err).toContain('unknown command "nope"');
     expect(unknown.err).toContain('--help');
-    expect(run(['keys', 'extra']).err).toContain('unexpected argument "extra"');
+    expect((await run(['keys', 'extra'])).err).toContain('unexpected argument "extra"');
   });
 });

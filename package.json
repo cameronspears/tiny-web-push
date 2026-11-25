@@ -1,7 +1,7 @@
 {
   "name": "tiny-web-push",
   "version": "0.1.0",
-  "description": "Send Web Push notifications from Node with no dependencies. RFC 8291 encryption and RFC 8292 VAPID on node:crypto.",
+  "description": "Send Web Push notifications from Node, Deno, Bun, Cloudflare Workers or Vercel Edge with no dependencies. RFC 8291 encryption and RFC 8292 VAPID on Web Crypto.",
   "keywords": [
     "web-push",
     "push",
@@ -10,7 +10,12 @@
     "rfc8291",
     "rfc8292",
     "aes128gcm",
-    "zero-dependency"
+    "zero-dependency",
+    "webcrypto",
+    "edge",
+    "cloudflare-workers",
+    "deno",
+    "bun"
   ],
   "homepage": "https://github.com/cameronspears/tiny-web-push#readme",
   "bugs": {
@@ -40,7 +45,7 @@
     "CHANGELOG.md"
   ],
   "engines": {
-    "node": ">=20.12"
+    "node": ">=20"
   },
   "publishConfig": {
     "provenance": true,
@@ -48,7 +53,7 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
-    "test": "vitest run",
+    "test": "pnpm build && vitest run",
     "typecheck": "tsc --noEmit",
     "demo": "pnpm build && node demo/server.mjs"
   },

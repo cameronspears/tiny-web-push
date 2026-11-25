@@ -1,6 +1,7 @@
 # tiny-web-push
 
-Send web push notifications from Node, built on `node:crypto` and `fetch`. No dependencies.
+Send web push notifications from Node, Deno, Bun, Cloudflare Workers or Vercel Edge. Built on Web
+Crypto and `fetch`, with no dependencies.
 
 To try it, clone this repo, run `pnpm install && pnpm demo` and open http://localhost:4174. Press
 the button and your own machine sends your browser a real notification.
@@ -46,7 +47,37 @@ self.addEventListener('push', (event) => {
 });
 ```
 
-Needs Node 20.12 or later. ESM only.
+Needs Node 20 or later, or any runtime with `fetch` and Web Crypto. ESM only.
+
+## Where it runs
+
+It uses only standard web APIs, so the same code runs on Node 20 or later, Deno, Bun, Cloudflare
+Workers and Vercel Edge. Nothing in the library comes from Node.
+
+That's the big difference from web-push. web-push is built on Node's own `crypto` and `https`
+modules, so it needs Node and doesn't run on edge runtimes. tiny-web-push does the same encryption
+and signing with Web Crypto, which all of these runtimes have.
+
+On Cloudflare Workers it looks like this:
+
+```js
+import { sendWebPush } from 'tiny-web-push';
+
+export default {
+  async fetch(request, env) {
+    const { result } = await sendWebPush(await request.json(), 'Hello', {
+      vapid: {
+        publicKey: env.VAPID_PUBLIC_KEY,
+        privateKey: env.VAPID_PRIVATE_KEY,
+        subject: 'mailto:you@example.com',
+      },
+    });
+    return Response.json({ result });
+  },
+};
+```
+
+Only the `tiny-web-push keys` command needs Node.
 
 ## Results
 
@@ -87,7 +118,8 @@ The payload can be a string or bytes, up to 3993 bytes. If you need more, send a
 rest.
 
 `encryptWebPushPayload`, `vapidAuthorization`, `generateVapidKeys`, `classifyPushStatus` and
-`isKnownPushService` are exported too, if you want to send the request yourself.
+`isKnownPushService` are exported too, if you want to send the request yourself. The first three
+return promises.
 
 ## Keys
 
@@ -98,16 +130,25 @@ npx tiny-web-push keys
 Prints a new VAPID key pair as `.env` lines. The public key goes to the browser. Keep the private
 key secret, and keep the pair for good: a new pair breaks every existing subscription.
 
+Without Node, make the pair in code instead:
+
+```js
+import { generateVapidKeys } from 'tiny-web-push';
+
+const { publicKey, privateKey } = await generateVapidKeys();
+```
+
 ## How it's tested
 
 The tests reproduce the example in RFC 8291 Appendix A byte for byte, using the RFC's own keys and
-salt. They also decrypt each message the way a browser would.
+salt. They also decrypt each message the way a browser would. Another test fails if the built
+library uses anything from Node.
 
 ## Why not web-push
 
 [web-push](https://www.npmjs.com/package/web-push) is the well-known library for this and has years
-of production use. It's bigger and has dependencies. If you need the older `aesgcm` encoding or a
-built-in proxy option, use web-push.
+of production use. It's bigger, has dependencies and only runs on Node. If you need the older
+`aesgcm` encoding or a built-in proxy option, use web-push.
 
 ## License
 

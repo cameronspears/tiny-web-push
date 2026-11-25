@@ -9,7 +9,7 @@ const HOST = '127.0.0.1';
 
 let keys = { publicKey: process.env.VAPID_PUBLIC_KEY, privateKey: process.env.VAPID_PRIVATE_KEY };
 if (!keys.publicKey || !keys.privateKey) {
-  keys = generateVapidKeys();
+  keys = await generateVapidKeys();
   console.log('No VAPID keys set, so the demo made a fresh pair for this run.');
 }
 const vapid = { ...keys, subject: 'mailto:demo@example.com' };
