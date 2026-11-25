@@ -1,0 +1,60 @@
+{
+  "name": "tiny-web-push",
+  "version": "0.1.0",
+  "description": "Send Web Push notifications from Node with no dependencies. RFC 8291 encryption and RFC 8292 VAPID on node:crypto.",
+  "keywords": [
+    "web-push",
+    "push",
+    "notifications",
+    "vapid",
+    "rfc8291",
+    "rfc8292",
+    "aes128gcm",
+    "zero-dependency"
+  ],
+  "homepage": "https://github.com/cameronspears/tiny-web-push#readme",
+  "bugs": {
+    "url": "https://github.com/cameronspears/tiny-web-push/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/cameronspears/tiny-web-push.git"
+  },
+  "license": "MIT",
+  "author": "Cameron Spears",
+  "type": "module",
+  "sideEffects": false,
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "bin": {
+    "tiny-web-push": "./dist/bin.js"
+  },
+  "files": [
+    "dist",
+    "CHANGELOG.md"
+  ],
+  "engines": {
+    "node": ">=20.12"
+  },
+  "publishConfig": {
+    "provenance": true,
+    "access": "public"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "demo": "pnpm build && node demo/server.mjs"
+  },
+  "devDependencies": {
+    "@types/node": "^20.19.43",
+    "typescript": "^7.0.2",
+    "vitest": "^4.1.12"
+  }
+}

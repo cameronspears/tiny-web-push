@@ -1,0 +1,236 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>tiny-web-push demo</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        --bg: #fff;
+        --text: #222;
+        --muted: #777;
+        --rule: #e6e6e6;
+        --code: #f6f6f6;
+        --bad: #b3261e;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --bg: #111;
+          --text: #ddd;
+          --muted: #888;
+          --rule: #2a2a2a;
+          --code: #1a1a1a;
+          --bad: #f2a29b;
+        }
+      }
+      body {
+        margin: 0;
+        background: var(--bg);
+        color: var(--text);
+        font: 17px/1.65 system-ui, sans-serif;
+      }
+      main {
+        max-width: 640px;
+        margin: 0 auto;
+        padding: 48px 20px 160px;
+      }
+      h1 {
+        font-size: 22px;
+        margin: 0 0 4px;
+      }
+      h2 {
+        font-size: 17px;
+        margin: 40px 0 8px;
+      }
+      p {
+        margin: 0 0 16px;
+      }
+      a {
+        color: inherit;
+      }
+      .muted {
+        color: var(--muted);
+      }
+      .bad {
+        color: var(--bad);
+      }
+      code {
+        font: 14px ui-monospace, Menlo, monospace;
+      }
+      pre {
+        overflow: auto;
+        margin: 0 0 16px;
+        padding: 12px 14px;
+        background: var(--code);
+        border: 1px solid var(--rule);
+        font: 13px/1.55 ui-monospace, Menlo, monospace;
+      }
+      ol li {
+        margin-bottom: 8px;
+      }
+      time {
+        color: var(--muted);
+        font: 14px ui-monospace, Menlo, monospace;
+        margin-right: 8px;
+      }
+      button {
+        font: 14px ui-monospace, Menlo, monospace;
+        padding: 6px 10px;
+        margin: 8px 0 16px;
+        background: var(--bg);
+        color: var(--text);
+        border: 1px solid var(--rule);
+        cursor: pointer;
+      }
+      button:disabled {
+        color: var(--muted);
+        cursor: default;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>tiny-web-push</h1>
+      <p class="muted">
+        Press the button. Your browser subscribes, hands the subscription to this demo's server, and
+        the server sends you a real push notification.
+        <a href="https://github.com/cameronspears/tiny-web-push">Source on GitHub</a>.
+      </p>
+
+      <button id="send" type="button">Send me a notification</button>
+      <p id="status" aria-live="polite">Ready.</p>
+
+      <h2>What happened</h2>
+      <ol id="log">
+        <li class="muted">Nothing yet.</li>
+      </ol>
+      <p id="received" hidden></p>
+
+      <h2>The server side</h2>
+      <p class="muted">The send in <code>demo/server.mjs</code>, trimmed.</p>
+<pre>import { sendWebPush } from 'tiny-web-push';
+
+const outcome = await sendWebPush(
+  subscription,
+  JSON.stringify({ title, body }),
+  { vapid, ttl: 60, urgency: 'high' }
+);
+
+// outcome.result is 'sent', 'gone', 'throttled',
+// 'auth', 'invalid' or 'failed'. It never throws
+// on a failed send.</pre>
+    </main>
+
+    <script type="module">
+      const button = document.getElementById('send');
+      const status = document.getElementById('status');
+      const log = document.getElementById('log');
+      const received = document.getElementById('received');
+
+      /** What each result means, in plain words. */
+      const RESULTS = {
+        sent: 'The push service accepted it. Watch for the notification.',
+        gone: 'The push service says this subscription is dead. Press the button again.',
+        throttled: 'Sending too fast. Wait a moment and try again.',
+        auth: 'The push service rejected the VAPID keys. Restart the demo server.',
+        invalid: 'The server refused this subscription before sending.',
+        failed: 'The push service could not be reached. Check your connection.',
+      };
+
+      /** Adds one numbered line to the log, with the time it happened. */
+      function note(text, bad = false) {
+        const li = document.createElement('li');
+        const time = document.createElement('time');
+        time.textContent = new Date().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit', second: '2-digit' });
+        li.append(time, text);
+        if (bad) li.className = 'bad';
+        log.append(li);
+      }
+
+      /**
+       * The page's one state value: 'ready' | 'working' | 'unsupported' | 'denied'.
+       * Only setState changes it, and the button follows it.
+       */
+      let state = 'ready';
+      function setState(next, message, bad = false) {
+        state = next;
+        button.disabled = state !== 'ready';
+        button.textContent = state === 'working' ? 'Sending…' : 'Send me a notification';
+        status.textContent = message;
+        status.className = bad ? 'bad' : '';
+      }
+
+      const supported = 'serviceWorker' in navigator && 'PushManager' in window && 'Notification' in window;
+      const deniedMessage =
+        'Notifications are blocked for this site. Allow them in the site settings (the icon left of the address bar), then reload.';
+      if (!supported) {
+        setState(
+          'unsupported',
+          'This browser does not support push notifications. Try Chrome, Firefox or Edge. On iPhone, add this page to your Home Screen first.',
+          true,
+        );
+      } else if (Notification.permission === 'denied') {
+        setState('denied', deniedMessage, true);
+      }
+
+      navigator.serviceWorker?.addEventListener('message', (event) => {
+        if (event.data?.type !== 'push-received') return;
+        note('Your browser received and decrypted it');
+        const title = event.data.title ?? 'New message';
+        received.textContent = event.data.body ? `Received: ${title} — ${event.data.body}` : `Received: ${title}`;
+        received.hidden = false;
+      });
+
+      button.addEventListener('click', async () => {
+        if (state !== 'ready') return;
+        setState('working', 'Working…');
+        log.replaceChildren();
+        received.hidden = true;
+        try {
+          const permission = await Notification.requestPermission();
+          if (permission !== 'granted') {
+            note(`Permission: ${permission}`, true);
+            if (permission === 'denied') return setState('denied', deniedMessage, true);
+            return setState('ready', 'You closed the prompt. Press the button to ask again.');
+          }
+          note('Permission granted');
+
+          const registration = await navigator.serviceWorker.register('/sw.js');
+          await navigator.serviceWorker.ready;
+          note('Service worker ready');
+
+          const { publicKey } = await fetch('/api/key').then((r) => r.json());
+          // The server makes new keys each run, so drop any subscription made with old ones.
+          await (await registration.pushManager.getSubscription())?.unsubscribe();
+          const subscription = await registration.pushManager.subscribe({
+            userVisibleOnly: true,
+            applicationServerKey: publicKey,
+          });
+          note(`Subscribed with ${new URL(subscription.endpoint).hostname}`);
+
+          const response = await fetch('/api/send', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(subscription),
+          });
+          const outcome = await response.json();
+          if (!response.ok) throw new Error(outcome.error ?? `Server answered ${response.status}`);
+          note(outcome.bytes ? `Server encrypted it: ${outcome.bytes} bytes` : 'Server encrypted it');
+
+          const sent = outcome.result === 'sent';
+          note(
+            outcome.status
+              ? `Push service replied ${outcome.status} in ${outcome.ms} ms (${outcome.result})`
+              : `No reply from the push service (${outcome.result})`,
+            !sent,
+          );
+          setState('ready', RESULTS[outcome.result] ?? 'Unexpected result.', !sent);
+        } catch (error) {
+          note(`Stopped: ${error.message}`, true);
+          setState('ready', 'Something went wrong. The last line in the log says what.', true);
+        }
+      });
+    </script>
+  </body>
+</html>
